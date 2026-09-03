@@ -4,10 +4,6 @@ Run with: streamlit run app.py
 """
 from __future__ import annotations
 
-from datetime import date
-from io import StringIO
-from urllib.parse import quote_plus
-
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -18,6 +14,11 @@ from scipy.optimize import differential_evolution, minimize
 
 
 st.set_page_config(page_title="Solar Tilt Optimizer", page_icon="☀️", layout="wide")
+st.markdown("""<style>
+div[data-testid="stMetric"] {background: #fff8e7; border: 1px solid #f6c453; border-radius: 12px; padding: 16px;}
+div[data-testid="stMetricLabel"] {font-weight: 700; color: #334155;}
+div[data-testid="stMetricValue"] {font-size: 2.05rem; font-weight: 800; color: #0f172a;}
+</style>""", unsafe_allow_html=True)
 
 NOMINATIM = "https://nominatim.openstreetmap.org/search"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
@@ -136,15 +137,27 @@ def daily_energy(irradiance: np.ndarray, weather: pd.DataFrame, area: float, eff
     return output
 
 
+def build_location_query(city: str, state: str, postal_code: str, country: str) -> str:
+    """Create an unambiguous location-search query from the form fields."""
+    parts = [city.strip(), state.strip(), postal_code.strip(), country.strip()]
+    return ", ".join(part for part in parts if part)
+
+
 st.title("☀️ Solar Tilt Optimizer")
 st.caption("Forecast-informed panel-angle recommendations using Open-Meteo solar weather data.")
 
 with st.sidebar:
-    st.header("System inputs")
-    location = st.text_input("Location", "Phoenix, AZ", help="City, ZIP/postal code, or a detailed address.")
+    st.header("Location check")
+    st.caption("Complete as much as you know. City and country are usually enough.")
+    city = st.text_input("City", "Phoenix")
+    state = st.text_input("State / province", "AZ")
+    postal_code = st.text_input("ZIP / postal code", "")
+    country = st.text_input("Country", "United States")
+    st.divider()
+    st.header("Panel and optimization")
     area = st.slider("Panel area (m²)", 1.0, 100.0, 15.0, 0.5)
-    efficiency = st.slider("Panel efficiency (%)", 10.0, 30.0, 20.0, 0.5) / 100
-    mode = st.radio("Adjustment mode", ["Daily optimal", "Quarterly plan", "Fixed annual"], help="Daily uses the next 24 hours; quarterly produces four seasonal recommendations; fixed annual uses the full forecast.")
+    efficiency = st.slider("Panel efficiency (%)", 0.0, 100.0, 20.0, 1.0, help="The percent of sunlight converted to electricity. Typical solar panels are about 15-25% efficient.") / 100
+    mode = st.selectbox("How often can the panel be adjusted?", ["Daily", "Monthly", "Quarterly", "Biannual", "Annual"], help="The app uses the live seven-day forecast for the recommendation, then estimates the selected period's energy from that forecast.")
     calculate = st.button("Calculate recommendation", type="primary", use_container_width=True)
 
 if "calculated" not in st.session_state:
@@ -153,6 +166,10 @@ if calculate:
     st.session_state.calculated = True
 
 if st.session_state.calculated:
+    location = build_location_query(city, state, postal_code, country)
+    if not location:
+        st.error("Enter at least a city, ZIP/postal code, or country before calculating.")
+        st.stop()
     try:
         with st.spinner("Locating site and retrieving the solar forecast..."):
             latitude, longitude, place = geocode(location)
@@ -164,7 +181,7 @@ if st.session_state.calculated:
         source_note = "Demo forecast - live lookup was unavailable"
         st.warning(f"{source_note}: {exc}")
 
-    if mode == "Daily optimal":
+    if mode == "Daily":
         active_weather = weather.iloc[:24].copy()
     else:
         active_weather = weather.copy()
@@ -177,13 +194,42 @@ if st.session_state.calculated:
     today_energy = optimized_daily.iloc[:24]["energy_kwh"].sum()
     fixed_today = fixed_daily.iloc[:24]["energy_kwh"].sum()
     gain = (today_energy / fixed_today - 1) * 100 if fixed_today else 0
+    period_days = {"Daily": 1, "Monthly": 30, "Quarterly": 91, "Biannual": 182, "Annual": 365}
+    selected_days = period_days[mode]
+    forecast_daily_average = optimized_daily.groupby("date")["energy_kwh"].sum().mean()
+    period_energy = today_energy if mode == "Daily" else forecast_daily_average * selected_days
+    energy_label = "Predicted energy today" if mode == "Daily" else f"Estimated {mode.lower()} energy"
 
-    st.success(f"📍 {place} · {latitude:.4f}°, {longitude:.4f}° · {source_note}")
+    st.success(f"Location confirmed: {place} · {latitude:.4f}°, {longitude:.4f}° · {source_note}")
+    if mode != "Daily":
+        st.info(f"{mode} energy is a {selected_days}-day projection using the average of the available seven-day live forecast. It is not a full historical annual weather simulation.")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Recommended tilt", f"{beta:.1f}°", f"{beta - abs(latitude):+.1f}° vs. latitude")
     c2.metric("Recommended azimuth", f"{gamma:.1f}°", "0° = south")
-    c3.metric("Predicted energy today", f"{today_energy:.1f} kWh")
+    c3.metric(energy_label, f"{period_energy:.1f} kWh")
     c4.metric("Gain vs. latitude tilt", f"{gain:+.1f}%")
+
+    # The strongest 75% of today's expected irradiance is the practical capture window.
+    today_schedule = optimized_daily.iloc[:24].copy()
+    peak_index = today_schedule["plane_irradiance_wm2"].idxmax()
+    peak_time = today_schedule.loc[peak_index, "time"]
+    peak_wm2 = today_schedule.loc[peak_index, "plane_irradiance_wm2"]
+    capture_hours = today_schedule[today_schedule["plane_irradiance_wm2"] >= peak_wm2 * 0.75]
+    if peak_wm2 > 0 and not capture_hours.empty:
+        capture_start = capture_hours.iloc[0]["time"]
+        capture_end = capture_hours.iloc[-1]["time"] + pd.Timedelta(hours=1)
+        capture_window = f"{capture_start.strftime('%I:%M %p').lstrip('0')} - {capture_end.strftime('%I:%M %p').lstrip('0')}"
+        peak_display = peak_time.strftime("%I:%M %p").lstrip("0")
+    else:
+        capture_start = capture_end = None
+        capture_window = "No strong solar window forecast"
+        peak_display = "No daylight forecast"
+
+    st.subheader("Today's solar capture timer")
+    st.caption("The highlighted window contains hours expected to reach at least 75% of today's peak solar input.")
+    timer_left, timer_right = st.columns(2)
+    timer_left.metric("Best capture window", capture_window)
+    timer_right.metric("Peak solar time", peak_display, f"{peak_wm2:.0f} W/m² at panel" if peak_wm2 else None)
 
     left, right = st.columns(2)
     hourly_chart = pd.DataFrame({
@@ -193,7 +239,10 @@ if st.session_state.calculated:
     }).melt("Time", var_name="Configuration", value_name="Irradiance (W/m²)")
     with left:
         st.subheader("Today’s plane-of-array irradiance")
-        st.plotly_chart(px.line(hourly_chart, x="Time", y="Irradiance (W/m²)", color="Configuration", template="plotly_white"), use_container_width=True)
+        solar_chart = px.line(hourly_chart, x="Time", y="Irradiance (W/m²)", color="Configuration", template="plotly_white")
+        if capture_start is not None:
+            solar_chart.add_vrect(x0=capture_start, x1=capture_end, fillcolor="#fbbf24", opacity=0.18, line_width=0, annotation_text="Best capture window", annotation_position="top left")
+        st.plotly_chart(solar_chart, use_container_width=True)
     with right:
         st.subheader("7-day energy forecast")
         weekly = optimized_daily.groupby("date", as_index=False)["energy_kwh"].sum()
@@ -209,17 +258,16 @@ if st.session_state.calculated:
     heatmap.update_layout(template="plotly_white", xaxis_title="Tilt (degrees)", yaxis_title="Azimuth (degrees; east - / west +)", height=390)
     st.plotly_chart(heatmap, use_container_width=True)
 
-    if mode == "Quarterly plan":
-        st.subheader("Seasonal adjustment plan")
-        quarters = np.array_split(weather, 4)
+    schedule_counts = {"Daily": 7, "Monthly": 1, "Quarterly": 4, "Biannual": 2, "Annual": 1}
+    schedule_count = schedule_counts[mode]
+    if schedule_count > 1:
+        st.subheader(f"{mode} adjustment outlook")
+        periods = np.array_split(weather, schedule_count)
         plan = []
-        previous_tilt = None
-        for label, quarter in zip(["Q1", "Q2", "Q3", "Q4"], quarters):
-            q_beta, q_gamma, _ = optimize(quarter, latitude, longitude)
-            if previous_tilt is not None:
-                q_beta = float(np.clip(q_beta, previous_tilt - 30, previous_tilt + 30))
-            previous_tilt = q_beta
-            plan.append({"Period": label, "Tilt (°)": round(q_beta, 1), "Azimuth (°)": round(q_gamma, 1)})
+        for index, period in enumerate(periods, start=1):
+            q_beta, q_gamma, _ = optimize(period, latitude, longitude)
+            date_range = f"{period.iloc[0]['time'].strftime('%b %d')} - {period.iloc[-1]['time'].strftime('%b %d')}"
+            plan.append({"Forecast window": date_range, "Tilt (°)": round(q_beta, 1), "Azimuth (°)": round(q_gamma, 1)})
         st.dataframe(pd.DataFrame(plan), use_container_width=True, hide_index=True)
 
     export = optimized_daily.copy()
